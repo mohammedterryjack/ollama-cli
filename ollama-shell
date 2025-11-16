@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+import os
+import json
+import pty
+import subprocess
+import threading
+import click
+import requests
+from collections import deque
+from pyfiglet import Figlet
+
+f = Figlet(font="smslant")
+
+banner = f.renderText("Ollama")
+
+DEFAULT_TEMPLATE = """You are a helpful assistant. Use the provided context to answer the user.
+Context:
+{context}
+
+User: {query}
+"""
+
+@click.command()
+@click.option(
+    "-v", "--verbose",
+    is_flag=True,
+    help="Print debug info: URL and payload before sending"
+)
+@click.option(
+    "-k", "--key",
+    default=None,
+    help="API key / token to pass to the Ollama server (optional)"
+)
+@click.option("-m", "--model", required=True, help="Ollama model")
+@click.option("-e", "--endpoint", default="localhost", help="Ollama host")
+@click.option("-p", "--port", default=11434, help="Ollama port")
+@click.option("-l", "--lines", default=40, help="Number of lines of context")
+@click.option("-s", "--scheme", default="http", help="URL scheme: http or https")
+def ollama_sh(verbose, key, model, endpoint, port, lines, scheme):
+    """
+    A custom shell that captures ALL terminal output in memory and
+    sends selected context to Ollama when you type `ollama <query>`.
+    """
+
+    # in-memory context buffer
+    context_buffer = deque(maxlen=2000)
+
+    click.secho(banner, fg="blue", bold=True)
+    click.secho("✨ Welcome to ollama-shell — a context-aware shell ✨", fg="green")
+    click.echo("Type commands normally. Use:\n")
+    click.echo("  ollama <your question>")
+    click.echo("  exit / quit to leave\n")
+
+    # Start a real bash shell using PTY
+    master_fd, slave_fd = pty.openpty()
+    shell = subprocess.Popen(
+        ["/bin/bash"],
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        text=True,
+        close_fds=True,
+    )
+    url = f"{scheme}://{endpoint}:{port}/api/chat" 
+    headers = {}
+
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+
+    # Thread to read and capture shell output
+    def reader():
+        while True:
+            try:
+                data = os.read(master_fd, 1024).decode(errors="ignore")
+                if not data:
+                    break
+                print(data, end="")  # show to user
+                context_buffer.append(data)
+            except OSError:
+                break
+
+    threading.Thread(target=reader, daemon=True).start()
+
+    # Interactive loop
+    while True:
+        try:
+            cmd = input("▶ ").strip()
+        except EOFError:
+            break
+
+        if cmd in ("exit", "quit"):
+            break
+
+        # INTERCEPT ollama queries
+        if cmd.startswith("ollama "):
+            query = cmd[len("ollama "):]
+
+            # build context
+            ctx = "\n".join(list(context_buffer)[-lines:])
+
+            payload = {
+                "model": model,
+                "messages": [
+                    {"role": "user", "content": DEFAULT_TEMPLATE.format(context=ctx, query=query)}
+                ],
+                "stream": False,
+            }
+
+            click.secho("\n🧠 Sending query with context...\n", fg="yellow")
+            if verbose:
+                click.secho("🔹 URL: {url}", fg="yellow")
+                click.secho("🔹 Payload being sent:", fg="yellow")
+                click.secho(json.dumps(payload, indent=2), fg="yellow")
+
+
+            try:
+                r = requests.post(url, headers=headers, verify=False, json=payload)
+                r.raise_for_status()
+                reply = r.json()["message"]["content"]
+                click.secho(reply + "\n", fg="cyan")
+                for line in reply.splitlines():
+                    context_buffer.append(line)
+            except Exception as e:
+                click.secho(f"Request failed: {e}", fg="red")
+
+            continue
+
+        # Otherwise send to bash
+        os.write(master_fd, (cmd + "\n").encode())
+
+    shell.terminate()
+    click.echo("\nGoodbye!")
+
+
+if __name__ == "__main__":
+    ollama_sh()
+
